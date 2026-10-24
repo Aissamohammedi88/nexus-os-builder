@@ -1,10 +1,10 @@
 # ═══════════════════════════════════════════════════════════════════════════════
-# NEXUS SECURITY — Bandit SAST (Production Grade)
-# Détecte les vulnérabilités Python et les affiche dans l'onglet Security.
-# Bloque la PR si une faille HIGH est trouvée.
+# BANDIT SECURITY SCAN — OFFICIAL PyCQA ACTION
+# Uses the official Bandit Action maintained by the PyCQA team.
+# Scans Python code for common security issues and uploads results to GitHub Security.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-name: Bandit Security Scan
+name: Bandit
 
 on:
   push:
@@ -12,7 +12,7 @@ on:
   pull_request:
     branches: [ "main", "master" ]
   schedule:
-    # Scan automatique chaque dimanche à 03:00 UTC
+    # Weekly scan every Sunday at 03:00 UTC
     - cron: '0 3 * * 0'
   workflow_dispatch:
 
@@ -23,69 +23,27 @@ permissions:
 
 jobs:
   bandit:
-    name: "🛡️ Bandit Analysis"
+    name: "🛡️ Bandit Security Analysis"
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          persist-credentials: false
 
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+      - name: Run Bandit Analysis
+        uses: PyCQA/bandit-action@v1
         with:
+          # Python version to use
           python-version: '3.12'
-          cache: 'pip'
-
-      - name: Install Bandit
-        run: |
-          python -m pip install --upgrade pip
-          pip install bandit[toml]
-
-      - name: Create Bandit Config
-        run: |
-          # Configuration stricte pour éviter les faux positifs tout en bloquant les vraies failles
-          cat << 'EOF' > .bandit
-          [bandit]
-          exclude = .git,__pycache__,build,dist,tests,venv,.venv,.github
-          skips = B101,B311,B404,B603,B607
-          level = MEDIUM
-          confidence = HIGH
-          EOF
-
-      - name: Run Bandit Scan (SARIF)
-        run: |
-          # Génération du fichier SARIF pour GitHub Security
-          bandit -r . -c .bandit -f sarif -o bandit-results.sarif || true
-          
-          # Génération d'un rapport JSON pour la vérification manuelle
-          bandit -r . -c .bandit -f json -o bandit-results.json || true
-
-      - name: Upload SARIF to GitHub Security
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: bandit-results.sarif
-          category: bandit
-
-      - name: Check for Critical/High findings
-        run: |
-          # Vérification stricte : si des erreurs HIGH sont trouvées, le pipeline échoue
-          if grep -q '"level": "error"' bandit-results.sarif 2>/dev/null; then
-            echo "::error::Failles de sécurité critiques détectées. Consultez l'onglet Security pour les détails."
-            exit 1
-          else
-            echo "✓ Aucune faille critique détectée. Code sécurisé."
-          fi
-
-      - name: Upload Report Artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bandit-security-report
-          path: |
-            bandit-results.json
-            bandit-results.sarif
-          retention-days: 7
+          # Path(s) to scan (default: current directory)
+          targets: .
+          # Exclude test and build directories
+          exclude: '.git,__pycache__,build,dist,tests,venv,.venv,node_modules'
+          # Only report issues of HIGH severity and HIGH confidence to avoid noise
+          severity: 'high'
+          confidence: 'high'
+          # Optional: path to a custom .bandit config file
+          # configfile: '.bandit'
+          # Optional: path to a baseline report for comparison
+          # baseline: 'baseline.json'
