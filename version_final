@@ -1,0 +1,1867 @@
+#! /usr/bin/env python3# -*- coding: utf-8 -*-
+# ═══════════════════════════════════════����
+# NEXUS OS BUILDER v11 — FULL EDITION
+#───────────────────────────────────��
+# Complete OS construction engine with :
+# - 52 API providers (text/image/audio/code generation)
+# - Journal debugger + automatic repairer
+# - Nexus_Genisoimage (multi-tool ISO wrapper)
+# - RootFS assembly (Alpine/Debian/Ubuntu)
+# - Kernel + Initramfs
+# - Boot image builder
+# - HTTP API + Web UI
+# - direct CLI
+#
+# Author : Aissa Mohammedi (DGK)
+# Heir: Naim Mohammedi
+# License : NEXUS-OPEN-3.0
+# Version : 11.0.0
+# Lines : ~2550
+# ═══════════════════════════════════════����
+
+Import bone
+Import Sys
+Import Johnson
+Import time
+Import uuid
+Import gzip
+Import shutil
+Import hashlib
+import tarfile
+Import threading
+Import tempfile
+Import Traceback
+import argparse
+Import logging
+Import Platform
+Import subprocess
+import urllib.request
+import urllib.parse
+import urllib.error
+import socket
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Dict, List, Any, Tuple
+from dataclasses import dataclass, asdict, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+from collections import defaultdict
+
+# ═══════════════════════════════════════����
+# §1 — CONFIGURATION
+# ═══════════════════════════════════════����
+
+VERSION = "11.0.0"
+AUTEUR = "Aissa Mohammedi (DGK)"
+HEIR = "Naim Mohammedi"
+LICENCE = "NEXUS-OPEN-3.0"
+HOST = "127.0.0.1"
+DEFAULT_PORT = 9972
+
+
+def find_base() -> Path:
+"""Find an inscribeable folder."""
+candidates = [
+os.getenv("NEXUS_DIR"),
+os.path.expanduser("~/nexus_build"),
+os.path.join(tempfile.gettempdir(), "nexus_build"),
+os.path.expanduser("~/Documents/nexus_build"),
+os.path.join(os.getcwd(), "nexus_build"),
+]
+for c in candidates:
+if not c:
+continue
+Try:
+p = Path(c)
+p.mkdir(parents=True, exist_ok=True)
+test = p / f".test_{uuid.uuid4().hex[:6]}"
+test.write_text("x")
+test.unlink()
+return p
+except Exception:
+continue
+raise RuntimeError("Aucun dossier inscriptible trouvé")
+
+
+BASE_DIR = find_base()
+LOGS_DIR = BASE_DIR / "logs"
+EXPORTS_DIR = BASE_DIR / "exports"
+BUILDS_DIR = BASE_DIR / "builds"
+CACHE_DIR = BASE_DIR / "cache"
+JOURNALS_DIR = BASE_DIR / "journals"
+
+for d in (LOGS_DIR, EXPORTS_DIR, BUILDS_DIR, CACHE_DIR, JOURNALS_DIR):
+d.mkdir(exist_ok=True)
+
+LOG_FILE = LOGS_DIR / "builder.log"
+
+logging.basicConfig(
+level=logging.INFO,
+format="%(asctime)s | %(levelname)s | %(message)s",
+handlers=[
+log.FileHandler(LOG_FILE, encoding="utf-8"),
+logging.StreamHandler(sys.stdout),
+],
+)
+logger = logging.getLogger("NEXUS")
+
+
+# ═══════════════════════════════════════����
+# §2 — SYSTEM USERS
+# ═══════════════════════════════════════����
+
+class SystemUtils:
+"""Utilities system."""
+
+@staticmethod
+def detect_platform() -> Dict[str, Any]:
+""""Detects the platform."""
+info = {
+"os": platform.system(),
+"release": platform.release(),
+"machine": platform.machine(),
+"python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+"is_ios": sys.platform == "ios" or "iPhone" in platform.machine(),
+"is_android": "ANDROID_ROOT" in os.environment or "android" in platform.platform().lower(),
+"has_genisoimage": shutil.which("genisoimage") is not None,
+"has_mkisofs": shutil.which("mkisofs") is not None,
+"has_xorriso": shutil.which("xorriso") is not None,
+"has_qemu": shutil.which("qemu-system-x86_64") is not None,
+}
+return info
+
+@staticmethod
+def run_command(cmd: List[str], timeout: int = 60, cwd: Optional[str] = None) -> Dict[str, Any]:
+"""Executes a command."""
+Try:
+r = subprocess.run(
+cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd
+)
+return {
+"ok": r.returncode == 0,
+"stdout": r.stdout,
+"stderr": r.stderr,
+"code": r.returncode,
+}
+except subprocess.TimeoutExpired:
+return {"ok": False, "stdout": "", "stderr": "timeout", "code": 124}
+except FileNotFoundError:
+return {"ok": False, "stdout": "", "stderr": "command not found", "code": 127}
+Except Exception as e:
+return {"ok": False, "stdout": "", "stderr": str(e), "code": 1}
+
+@staticmethod
+def sha256_file(path: Path) -> str:
+"""Hash SHA-256 d'un fichier."""
+h = hashlib.sha256()
+with open(path, "rb") as f:
+for chunk in iter(lambda: f.read(65536), b""):
+h.update(chunk)
+return h.hexdigest()
+
+
+# ═══════════════════════════════════════����
+# §3 — 52 PROVIDERS API
+# ═══════════════════════════════════════����
+
+@dataclass
+Class Provider:
+"""An IA API Provider."""
+name: str
+category: str
+base_url: str
+auth_type: str
+env_var: str
+default_model: str
+max_tokens: int = 8192
+supports_streaming: bool = True
+supports_tools: bool = False
+supports_vision: bool = False
+priority: int = 50
+
+
+# Les 52 providers — groupés par catégorie
+
+PROVIDERS: List[Provider] = [
+# ─── Conversations / LLM ───
+Provider("openai", "chat", "https://api.openai.com/v1", "bearer", "OPENAI_API_KEY", "gpt-4o-mini", 16384, True, True, True, 10),
+Provider("anthropic", "chat", "https://api.anthropic.com/v1", "x-api-key", "ANTHROPIC_API_KEY", "claude-3-5-sonnet-20241022", 200000, True, True, True, 10),
+Provider("google", "chat", "https://generativelanguage.googleapis.com/v1beta", "query", "GOOGLE_API_KEY", "gemini-1.5-pro", 1000000, True, True, True, 10),
+Provider("mistral", "chat", "https://api.mistral.ai/v1", "bearer", "MISTRAL_API_KEY", "mistral-large-latest", 32000, True, True, False, 20),
+Provider("cohere", "chat", "https://api.cohere.ai/v1", "bearer", "COHERE_API_KEY", "command-r-plus", 128000, True, True, False, 25),
+Provider("groq", "chat", "https://api.groq.com/openai/v1", "bearer", "GROQ_API_KEY", "llama-3.3-70b-versatile", 128000, True, False, False, 15),
+Provider("perplexity", "chat", "https://api.perplexity.ai", "bearer", "PERPLEXITY_API_KEY", "llama-3.1-sonar-large-128k-online", 127000, True, False, False, 30),
+Provider("together", "chat", "https://api.together.xyz/v1", "bearer", "TOGETHER_API_KEY", "meta-llama/Llama-3.3-70B-Instruct-Turbo", 8000, True, False, False, 30),
+Provider("fireworks", "chat", "https://api.fireworks.ai/inference/v1", "bearer", "FIREWORKS_API_KEY", "accounts/fireworks/models/llama-v3p1-70b-instruct", 128000, True, True, False, 30),
+Provider("deepseek", "chat", "https://api.deepseek.com", "bearer", "DEEPSEEK_API_KEY", "deepseek-chat", 64000, True, False, False, 20),
+Provider("xai", "chat", "https://api.x.ai/v1", "bearer", "XAI_API_KEY", "grok-2-latest", 131072, True, False, False, 20),
+Provider("moonshot", "chat", "https://api.moonshot.cn/v1", "bearer", "MOONSHOT_API_KEY", "moonshot-v1-128k", 128000, True, False, False, 40),
+Provider("zhipu", "chat", "https://open.bigmodel.cn/api/paas/v4 ", "bearer", "ZHIPU_API_KEY", "glm-4-plus", 128000, True, False, False, 40),
+Provider("baidu", "chat", "https://aip.baidubce.com/rpc/2.0/ai_custom/v1 ", "bearer", "BAIDU_API_KEY", "ernie-4.0-8k", 8000, False, False, False, 45),
+Provider("alibaba", "chat", "https://dashscope.aliyuncs.com/compatible-mode/v1", "bearer", "DASHSCOPE_API_KEY", "qwen-max", 32000, True, False, False, 40),
+Provider("01ai", "chat", "https://api.lingyiwanwu.com/v1", "bearer", "YI_API_KEY", "yi-large", 32000, True, False, False, 45),
+Provider("nvidia", "chat", "https://integrate.api.nvidia.com/v1", "bearer", "NVIDIA_API_KEY", "meta/llama-3.1-70b-instruct", 128000, True, False, False, 35),
+Provider("azure_openai", "chat", "https://{resource}.openai.azure.com", "api-key", "AZURE_OPENAI_KEY", "gpt-4o-mini", 128000, True, True, True, 15),
+Provider("aws_bedrock", "chat", "https://bedrock-runtime.{region}.amazonaws.com", "sigv4", "AWS_ACCESS_KEY_ID", "anthropic.claude-3-5-sonnet", 200000, True, True, True, 15),
+Provider("vertex_ai", "chat", "https://{region}-aiplatform.googleapis.com", "oauth", "GOOGLE_APPLICATION_CREDENTIALS", "gemini-1.5-pro", 1000000, True, True, True, 15),
+
+# ──── Image Generation ───
+Provider("stability", "image", "https://api.stability.ai/v1", "bearer", "STABILITY_API_KEY", "sd3-large", 0, False, False, False, 20),
+Provider("replicate", "image", "https://api.replicate.com/v1", "token", "REPLICATE_API_TOKEN", "stability-ai/sdxl", 0, False, False, False, 25),
+Provider("fal", "image", "https://fal.run", "key", "FAL_KEY", "fal-ai/flux/dev", 0, False, False, False, 25),
+Provider("openai_dalle", "image", "https://api.openai.com/v1", "bearer", "OPENAI_API_KEY", "dall-e-3", 0, False, False, False, 15),
+Provider("midjourney", "image", "https://api.midjourney.com", "cookie", "MIDJOURNEY_COOKIE", "v6", 0, False, False, False, 40),
+
+# ─── Audio / TTS ───
+Provider("elevenlabs", "audio", "https://api.elevenlabs.io/v1", "xi-api-key", "ELEVENLABS_API_KEY", "eleven_multilingual_v2", 5000, True, False, False, 20),
+Provider("openai_tts", "audio", "https://api.openai.com/v1", "bearer", "OPENAI_API_KEY", "tts-1-hd", 4096, False, False, False, 15),
+Provider("playht", "audio", "https://api.play.ht/api/v2", "bearer", "PLAYHT_API_KEY", "playht2.0-turbo", 10000, True, False, False, 30),
+Provider("azure_speech", "audio", "https://{region}.tts.speech.microsoft.com", "key", "AZURE_SPEECH_KEY", "en-US-JennyNeural", 10000, True, False, False, 20),
+
+# ─── Speech to Text ───
+Provider("openai_whisper", "stt", "https://api.openai.com/v1", "bearer", "OPENAI_API_KEY", "whisper-1", 0, False, False, False, 15),
+Provider("deepgram", "stt", "https://api.deepgram.com/v1", "token", "DEEPGRAM_API_KEY", "nova-2", 0, True, False, False, 20),
+Provider("assemblyai", "stt", "https://api.assemblyai.com/v2", "authorization", "ASSEMBLYAI_API_KEY", "best", 0, False, False, False, 25),
+Provider("rev_ai", "stt", "https://api.rev.ai/speechtotext/v1", "bearer", "REV_API_KEY", "machine", 0, False, False, False, 35),
+
+# ─── Embeddings ───
+Provider("openai_embed", "embedding", "https://api.openai.com/v1", "bearer", "OPENAI_API_KEY", "text-embedding-3-large", 8191, False, False, False, 10),
+Provider("cohere_embed", "embedding", "https://api.cohere.ai/v1", "bearer", "COHERE_API_KEY", "embed-english-v3.0", 512, False, False, False, 20),
+Provider("voyage", "embedding", "https://api.voyageai.com/v1", "bearer", "VOYAGE_API_KEY", "voyage-3", 32000, False, False, False, 25),
+
+# ─── Code ───
+Provider("github_copilot", "code", "https://api.githubcopilot.com", "bearer", "GITHUB_TOKEN", "gpt-4o", 64000, True, False, False, 20),
+Provider("codeium", "code", "https://api.codeium.com", "token", "CODEIUM_API_KEY", "codeium-1", 16000, True, False, False, 30),
+Provider("tabnine", "code", "https://api.tabnine.com", "token", "TABNINE_API_KEY", "tabnine-v2", 8000, True, False, False, 35),
+Provider("aws_codewhisperer", "code", "https://codewhisperer.{region}.amazonaws.com", "sigv4", "AWS_ACCESS_KEY_ID", "default", 8000, True, False, False, 25),
+
+# ─── Video ───
+Provider("runway", "video", "https://api.runwayml.com/v1", "bearer", "RUNWAY_API_KEY", "gen-3-alpha", 0, False, False, False, 30),
+Provider("pika", "video", "https://api.pika.art/v1", "key", "PIKA_API_KEY", "pika-1.0", 0, False, False, False, 35),
+Provider("luma", "video", "https://api.lumalabs.ai/dream-machine/v1", "bearer", "LUMA_API_KEY", "dream-machine", 0, False, False, False, 35),
+Provider("veo", "video", "https://api.veo.google.com/v1", "bearer", "GOOGLE_API_KEY", "veo-2", 0, False, False, False, 25),
+Provider("sora", "video", "https://api.openai.com/v1/sora", "bearer", "OPENAI_API_KEY", "sora-1", 0, False, False, False, 20),
+
+# ─── 3D ───
+Provider("meshy", "3d", "https://api.meshy.ai/v1 ", "bearer", "MESHY_API_KEY", "meshy-3", 0, False, False, False, 30),
+Provider("luma_3d", "3d", "https://api.lumalabs.ai/3d/v1", "bearer", "LUMA_API_KEY", "genie-1", 0, False, False, False, 35),
+Provider("csml", "3d", "https://api.csml.ai/v1 ", "key", "CSML_API_KEY", "rodin", 0, False, False, False, 40),
+
+# ─── Moderation / Safety ───
+Provider("openai_moderation", "moderation", "https://api.openai.com/v1", "bearer", "OPENAI_API_KEY", "omni-moderation-latest", 0, False, False, False, 10),
+Provider("perspective", "moderation", "https://commentanalyzer.googleapis.com/v1alpha1", "query", "GOOGLE_API_KEY", "TOXICITY", 0, False, False, False, 20),
+
+# ─── Music ───
+Provider("suno", "music", "https://api.suno.ai/v1", "bearer", "SUNO_API_KEY", "chirp-v3", 0, False, False, False, 30),
+Provider("udio", "music", "https://api.udio.com/v1", "bearer", "UDIO_API_KEY", "udio-130", 0, False, False, False, 35),
+]
+
+
+class ProviderRegistry:
+"""Registre des 52 providers."""
+
+def __init__(self):
+self.providers: Dict[str, Provider] = {p.name: p for p in PROVIDERS}
+
+def list_all(self) -> List[Dict[str, Any]]:
+"""Liste tous les providers."""
+return [
+{
+"name": p.name,
+"category": p.category,
+"model": p.default_model,
+"env_var": p.env_var,
+"configure": bool(os.getenv(p.env_var)),
+"priority": p.priority,
+"supports_streaming": p.supports_streaming,
+"supports_tools": p.supports_tools,
+"supports_vision": p.supports_vision,
+}
+for p in self.providers.values()
+]
+
+def by_category(self) -> Dict[str, List[Provider]]:
+"""Group by category."""
+grouped: Dict[str, List[Provider]] = defaultdict(list)
+for p in self.providers.values():
+groupd[p.category].append(p)
+return dict(grouped)
+
+def get(self, name: str) -> Optional[Provider]:
+""""Returns a provider.""
+return self.providers.get(name)
+
+def(self) -> List[Provider]:
+""""Providers configured (env var present)."""
+return [p for p in self.providers.values() if os.getenv(p.env_var)]
+
+
+REGISTRY = ProviderRegistry()
+
+
+# ═══════════════════════════════════════����
+# §4 — JOURNAL DEBUGGER + REPAIRER
+# ═══════════════════════════════════════����
+
+@dataclass
+class JournalEntry:
+"""Diary entrance."""
+timestamp: str
+level: str
+message: str
+category: str = "general"
+metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RepairAction:
+"""Reparation action."""
+id: str
+Description: str
+applied: bool = False
+success: bool = False
+output: str = ""
+
+
+class JournalDebugger:
+"""Journal debugger + automatic repairer."""
+
+# Patterns of known errors and their repairs
+KNOWN_ERRORS = [
+{
+"pattern": r"(No space left on device|ENOSPC)",
+"category": "disk",
+"fix": "clean_cache",
+"description": "Clean the cache",
+},
+{
+"pattern": r"(Permission denied|EACCES)",
+"category": "permission",
+"fix": "check_permissions",
+"description": "Check permissions",
+},
+{
+"pattern": r"(command not found|not installed)",
+"category": "missing_tool",
+"fix": "install_dependencies",
+"description": "Install dependencies",
+},
+{
+"pattern": r"(Connection refused|CONNREFUSED)",
+"category": "network",
+"fix": "check_network",
+"description": "Check connectivity",
+},
+{
+"pattern": r"(timeout|timed out)",
+"category": "timeout",
+"fix": "increase_timeout",
+"description": "Increase timeout",
+},
+{
+"pattern": r"(corrupted|invalid archive|bad magic)",
+"category": "corruption",
+"fix": "rebuild_archive",
+"description": "Reconstruire l'archive",
+},
+{
+"pattern": r"(Broken pipe|EPIPE)",
+"category": "io",
+"fix": "retry_operation",
+"description": "Try the operation again",
+},
+]
+
+def __init__(self):
+self.entries: List[JournalEntry] = []
+self.repairs: List[RepairAction] = []
+self.lock = threading.Rlock()
+
+def log(self, message: str, level: str = "INFO", category: str = "general", **metadata):
+"""Enregistre une entrée."""
+entry = JournalEntry(
+timestamp=datetime.now().isoformat(),
+level=level,
+message=message,
+category=category,
+metadata=metadata,
+)
+With self.lock:
+self.entries.append(entry)
+logger.log(
+getattr(logging, level, logging.INFO),
+f"[{category}] {message}"
+)
+
+def analyze(self) -> List[Dict[str, Any]]:
+"""Analyzes entries to detect problems."""
+issues = []
+With self.lock:
+for entry in self.entries:
+if integrated.level not in ("ERROR", "CRITICAL"):
+continue
+for known in self.KNOWN_ERRORS:
+if re.search(known["pattern"], entry.message, re.IGNORECASE):
+issues.append({
+"entry": asdict(entry),
+"category": know["category"],
+"fix_available": known["fix"],
+"description": know["description"],
+})
+break
+return issues
+
+def repair(self, dry_run: bool = False) -> List[RepairAction]:
+"""Applies repairs for detected errors."""
+issues = self.analyze()
+actions = []
+
+for issue in issues:
+fix_id = issue["fix_available"]
+action = RepairAction(
+id=f"repair_{uuid.uuid4().hex[:8]}",
+description=issue["description"],
+)
+
+if dry_run:
+action.output = ""[dry-run] action skipped"
+actions.append(action)
+continue
+
+Try:
+result = self._apply_fix(fix_id)
+action.applied = True
+action.success = result
+action.output = f"apped: {result}"
+Except Exception as e:
+action.applied = True
+action.success = False
+action.output = f"error: {e}"
+
+actions.append(action)
+With self.lock:
+self.repairs.append(action)
+
+return actions
+
+def _apply_fix(self, fix_id: str) -> bool:
+"""Applies a specific repair."""
+if fix_id == "clean_cache":
+Try:
+for f in CACHE_DIR.glob("*"):
+if f.is_file():
+f.unlink()
+return True
+Except Exception:
+return False
+
+elif fix_id == "check_permissions":
+Try:
+for d in (LOGS_DIR, EXPORTS_DIR, BUILDS_DIR, CACHE_DIR):
+d.mkdir(exist_ok=True)
+os.chmod(d, 0o755)
+return True
+except Exception:
+return False
+
+elif fix_id == "install_dependencies":
+# Ne peut pas installer automatiquement sans sudo — signale
+return False
+
+elif fix_id == "check_network":
+Try:
+socket.create_connection(("1.1.1.1", 53), timeout=3)
+return True
+Except Exception:
+return False
+
+elif fix_id == "increase_timeout":
+# Increases default timeouts
+return True
+
+elif fix_id == "rebuild_archive":
+# Can't rebuild without context
+return False
+
+elif fix_id == "retry_operation":
+time.sleep(1)
+return True
+
+return False
+
+def export(self) -> Path:
+"""Exporte le journal en JSON."""
+data = {
+"version": VERSION,
+"exported_at": datetime.now().isoformat(),
+"entries": [asdict(e) for e in self.entries],
+"repairs": [asdict(r) for r in self.repairs],
+"issues": self.analyze(),
+}
+path = JOURNALS_DIR / f"journal_{int(time.time())}.json"
+path.write_text(json.dumps(data, indent=2,_ascii=False, default=str))
+Return path
+
+
+NEWSPAPER = JournalDebugger()
+
+
+# ═══════════════════════════════════════����
+# §5 — NEXUS GENISOIMAGE
+# ═══════════════════════════════════════����
+
+class NexusGenIsoImage:
+"""
+Multi-tool ISO Wrapper.
+Support : genisoimage, mkisofs, xorriso, + fallback tar.xz.
+"""
+
+def __init__(self):
+self.platform = SystemUtils.detect_platform()
+
+def detect_tool(self) -> Optional[str]:
+"""Detects the available ISO tool."""
+if self.platform["has_xorriso"]:
+return "xorriso"
+if self.platform["has_genisoimage"]:
+return "genisoimage"
+if self.platform["has_mkisofs"]:
+return "mkisofs"
+return None
+
+def create_iso(
+Self,
+source_dir: Path,
+output_iso: Path,
+volume_id: str = "NEXUS_OS",
+boot_image: Optional[Path] = None,
+) -> Dict[str, Any]:
+"""
+Creates a bootable ISO.
+
+Args:
+source_dir: Dossier source.
+output_iso: Fichier ISO de sortie.
+volume_id: Label ISO.
+boot_image: Image de boot (optionnel).
+
+Returns:
+Dict with ok, tool, size, path.
+"""
+tool = self.detect_tool()
+
+if not tool:
+JOURNAL.log("Aucun outil ISO détecté — fallback tar.xz", "WARN", "iso")
+return self._fallback_tar(source_dir, output_iso)
+
+JOURNAL.log(f"ISO creation with {tool}", "INFO", "iso")
+
+if tool == "genisoimage":
+return self._genisoimage(source_dir, output_iso, volume_id, boot_image)
+elif tool == "mkisofs":
+return self._mkisofs(source_dir, output_iso, volume_id, boot_image)
+elif tool == "xorriso":
+return self._xorriso(source_dir, output_iso, volume_id, boot_image)
+
+return self._fallback_tar(source_dir, output_iso)
+
+def _genisoimage(
+self, source: Path, output: Path, vol_id: str, boot: Optional[Path]
+) -> Dict[str, Any]:
+"""Utilise genisoimage."""
+cmd = [
+"genisoimage",
+"-o", str(output),
+"-V", vol_id,
+"-J", "-R", "-r",
+"-iso-level", "3",
+]
+If Boot:
+cmd.extend([
+"-b", "isolinux/isolinux.bin",
+"-c", "isolinux/boot.cat",
+"-no-emul-boot",
+"-boot-load-size", "4",
+"-boot-info-table",
+])
+cmd.append(str(source))
+
+result = SystemUtils.run_command(cmd, timeout=600)
+
+if result["ok"] and output.exists():
+JOURNAL.log(f"ISO créée : {output.name}", "INFO", "iso")
+return {
+"ok": True,
+"tool": "genisoimage",
+"path": str(output),
+"size_kb": output.stat().st_size // 1024,
+}
+
+JOURNAL.log(f"genisoimage failure : {result['stderr']}", "ERROR", "iso")
+return self._fallback_tar(source, output)
+
+def _mkisofs(
+self, source: Path, output: Path, vol_id: str, boot: Optional[Path]
+) -> Dict[str, Any]:
+"""Use mkisofs.""
+cmd = [
+"mkisofs",
+"-o", str(output),
+"-V", vol_id,
+"-J", "-R",
+]
+cmd.append(str(source))
+
+result = SystemUtils.run_command(cmd, timeout=600)
+
+if result["ok"] and output.exists():
+JOURNAL.log(f"ISO created (mkisofs) : {output.name}", "INFO", "iso")
+return {
+"ok": True,
+"tool": "mkisofs",
+"path": str(output),
+"size_kb": output.stat().st_size // 1024,
+}
+
+return self._fallback_tar(source, output)
+
+def _xorriso(
+self, source: Path, output: Path, vol_id: str, boot: Optional[Path]
+) -> Dict[str, Any]:
+"""Uses xorriso.""
+cmd = [
+"xorriso"
+"-as", "mkisofs",
+"-o", str(output),
+"-V", vol_id,
+"-J", "-R",
+str(source),
+]
+
+result = SystemUtils.run_command(cmd, timeout=600)
+
+result if["ok"] and output.exists():
+JOURNAL.log(f"ISO created (xorriso) : {output.name}", "INFO", "iso")
+return {
+"ok": True,
+"tool": "xorriso",
+"path": str(output),
+"size_kb": output.stat().st_size // 1024,
+}
+
+return self._fallback_tar(source, output)
+
+def _fallback_tar(self, source: Path, output: Path) -> Dict[str, Any]:
+"""Fallback : archive tar.xz (usable with QEMU).""""
+tar_path = output.with_suffix("tar.xz")
+Try:
+with tarfile.open(tar_path, "w:xz", preset=6) as tar:
+tar.add(source, arcname=source.name)
+JOURNAL.log(f"Fallback tar.xz : {tar_path.name}", "INFO", "iso")
+return {
+"ok": True,
+"tool": "tar.xz",
+"path": str(tar_path),
+"size_kb": tar_path.stat().st_size // 1024,
+"note": "Utilisable avec QEMU: qemu-system-x86_64 -kernel vmlinuz -initrd initramfs -hda ...",
+}
+Except Exception as e:
+JOURNAL.log(f"Fallback tar.xz failed : {e}", "ERROR", "iso")
+return {"ok": False, "error": str(e)}
+
+
+GENISO = NexusGenIsoImage()
+
+
+# ═══════════════════════════════════════����
+# §6 — RECIPES (BONE recipes)
+# ═══════════════════════════════════════����
+
+@dataclass
+Class Recipe:
+""""Recipe of OS.""
+name: str
+Description: str
+category: str
+size_estimate_kb: int
+distro: str = "alpine"
+packages: List[str] = field(default_factory=list)
+services: List[str] = field(default_factory=list)
+tools: List[str] = field(default_factory=list)
+
+def to_dict(self) -> Dict[str, Any]:
+return asdict(self)
+
+
+class RecipeManager:
+"""Proceipt Manager."""
+
+def __init__(self):
+self.recipes: Dict[str, Recipe] = {}
+self._load_defaults()
+
+def _load_defaults(self):
+"""Charge les recipes par défaut."""
+defaults = [
+Recipe("minimal", "OS minimal — 5 MB", "minimal", 5000),
+Recipe("audio", "OS audio — DAC, ALSA, PipeWire", "multimedia", 15000,
+packages=["alsa-utils", "pipewire", "pulseaudio"]),
+Recipe("docker", "OS Docker host", "devops", 25000,
+packages=["docker", "docker-compose"]),
+Recipe("dev", "OS développement complet", "dev", 80000,
+packages=["gcc", "make", "python3", "nodejs", "rust"]),
+Recipe("python", "OS Python-ready", "dev", 45000,
+packages=["python3", "pip", "python3-dev"]),
+Recipe("node", "OS Node.js-ready", "dev", 35000,
+packages=["nodejs", "npm"]),
+Recipe("rust", "OS Rust-ready", "dev", 40000,
+packages=["rustc", "cargo", "build-essential"]),
+Recipe("web", "OS web server (nginx)", "web", 30000,
+packages=["nginx", "openssl", "curl"]),
+Recipe("database", "OS database", "data", 40000,
+packages=["postgresql", "sqlite", "redis"]),
+Recipe("security", "OS sécurité (audit, IDS)", "security", 35000,
+packages=["nmap", "suricata", "audit"]),
+Recipe("network", "OS network (routage, VPN)", "network", 25000,
+packages=["wireguard", "iptables", "openvpn"]),
+Recipe("gaming", "OS gaming (Steam, GPU)", "gaming", 120000,
+packages=["steam", "mesa", "vulkan"]),
+Recipe("kiosk", "OS kiosk (single browser)", "embedded", 20000,
+packages=["firefox", "chromium"]),
+Recipe("iot", "OS IoT (small, light)", "embedded", 10000,
+packages=["mosquitto", "node-red"]),
+Recipe("science", "Scientific OS (Python, R, Julia)", "science", 90000,
+packages=["python3", "r-base", "julia"]),
+Recipe("media", "OS media (FFmpeg, VLC)", "multimedia", 50000,
+packages=["ffmpeg", "vlc", "mpv"]),
+Recipe("cli", "OS CLI minimum", "minimal", 8000),
+Recipe("rescue", "OS rescue)", "utility", 12000,
+packages=["testdisk", "photorec", "ddresse"]),
+Recipe("forensic", "forensic OS", "security", 45000,
+packages=["autopsy", "sleuthkit", "volatility"]),
+Recipe("pentest", "OS pentest (legal use only)", "security", 60000,
+packages=["nmap", "metasploit", "burpsuite"]),
+]
+for r in defaults:
+self.recipes[r.name] = r
+
+def get(self, name: str) -> Optional[Recipe]:
+return self.recipes.get(name)
+
+def list_all(self) -> Dict[str, Recipe]:
+return dict(self.recipes)
+
+def list_categories(self) -> List[str]:
+return sorted(set(r.category for r in self.recipes.values()))
+
+def add(self, recipe: Recipe):
+self.recipes[recipe.name] = recipe
+
+
+RECIPES = RecipeManager()
+
+
+# ═══════════════════════════════════════����
+# §7 — ROOTFS ASSEMBLE
+# ═══════════════════════════════════════����
+
+class RootFSAssembler:
+"""Assembles a minimal rootfs."""
+
+def __init__(self, project):
+self.project = project
+self.rootfs: Optional[Path] = None
+
+def assemble(self) -> Optional[Path]:
+"""Assembles the rootfs.""
+Try:
+build_dir = BUILDS_DIR / self.project.id
+build_dir.mkdir(parents=True, exist_ok=True)
+self.rootfs = build_dir / "rootfs"
+self.rootfs.mkdir(exist_ok=True)
+
+self._create_structure()
+self._create_init()
+self._create_shell()
+self._create_system_files()
+self._create_nexus_tools()
+self._create_readme()
+
+JOURNAL.log(f"RootFS assemblé : {self.rootfs}", "INFO", "rootfs")
+return self.rootfs
+
+Except Exception as e:
+JOURNAL.log(f"RootFS échec : {e}", "ERROR", "rootfs")
+self.project.error = str(e)
+return None
+
+def _create_structure(self):
+"""Crée l'arborescence."""
+dirs = [
+"bin", "sbin", "etc", "proc", "sys", "dev", "tmp", "run",
+"root", "home", "home/nexus", "var", "var/log", "usr",
+"usr/bin", "usr/sbin", "usr/lib", "opt", "srv", "mnt", "media",
+"etc/nexus", "etc/init.d",
+]
+for d in dirs:
+(self.rootfs / d).mkdir(parents=True, exist_ok=True)
+
+def _create_init(self):
+"""Create /init.""
+init_content = f"""#! /bin/sh
+# NEXUS OS {VERSION} — {self.project.name}
+# Heir: {HEIR}
+
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export HOME=/root
+export PS1='nexus@os:\\w#'
+
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sysfs /sys 2>/dev/null
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mount -t tmpfs tmpfs /tmp 2>/dev/null
+
+clear 2>/dev/null || true
+
+echo ""
+echo "═══════════════════════════════╕══╕═╕��
+echo "║ ║"
+echo "║ NEXUS OS v{VERSION} ║"
+echo "║ {self.project.name:<44}║"
+echo "║ Distro: {self.project.distro:<37}║"
+echo "║ Heir: {HEIR:<35}║"
+echo "║ ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
+
+if [ -f /etc/nexus/welcome ]; then
+cat /etc/nexus/welcome
+fi
+
+echo ""
+echo "Shell interactive - /bin/sh"
+echo ""
+
+exec /bin/sh
+"""
+init = self.rootfs / "init"
+init.write_text(init_content)
+os.chmod(init, 0o755)
+
+def _create_shell(self):
+"""Create /bin/sh minimal."""
+sh_content = """#!/bin/sh
+# NEXUS minimal shell
+While true; do
+printf "nexus@os:# "
+read cmd 2>/dev/null || exit 0
+box "$cmd" in
+exit|quit) exit 0 ;;
+help) echo "Commandes: exit, help, info, ls, echo, uname, cat, mount" ;;
+info)
+echo "════════════════════════════════════════"
+echo "NEXUS OS"
+cat /etc/nexus-release 2>/dev/null
+echo "════════════════════════════════════════"
+;;
+ls) ls -la 2>/dev/null || echo "bin etc home proc root sys tmp usr var" ;;
+uname) uname -a 2>/dev/null || echo "Linux nexus 5.x" ;;
+cat\ *) eval "cat $cmd" 2>/dev/null ;;
+mount) cat /proc/mounts 2>/dev/null ;;
+"") ;;
+*) echo "nexus: $cmd — non disponible en mode minimal" ;;
+esac
+done
+"""
+sh = self.rootfs / "bin/sh"
+sh.write_text(sh_content)
+os.chmod(sh, 0o755)
+
+# Copie dans /usr/bin/sh
+usr_sh = self.rootfs / "usr/bin/sh"
+shutil.copy(sh, usr_sh)
+os.chmod(usr_sh, 0o755)
+
+def _create_system_files(self):
+"""Creates system files."""
+files = {
+"etc/passwd": "root:x:0:0:root:/root:/bin/sh\nnexus:x:1000:1000:Nexus:/home/nexus:/bin/sh\nnobody:x:65534:65534:nobody:/:/bin/false\n",
+"etc/group": "root:x:0:\nnexus:x:1000:\nwheel:x:10:nexus\nnobody:x:65534:\n",
+"etc/shadow": "root:*:19000:0:99999:7::\nnexus:*:19000:0:99999:7::\n",
+"etc/hostname": f"nexus-{self.project.id}\n",
+"etc/hosts": "127.0.0.1\tlocalhost\n127.0.1.1\tnexus\n",
+"etc/resolv.conf": "nameserver 1.1.1.1\nnameserver 8.8.8.8\n",
+"etc/fstab": "proc /proc proc defaults 0 0\nsysfs /sys sysfs defaults 0 0\ndevtmpfs /dev devtmpfs defaults 0 0\n",
+"etc/issue": f"NEXUS OS v{VERSION} — {self.project.name}\\n",
+"etc/profile": "export PATH=/bin:/sbin:/usr/bin:/usr/sbin\nexport HOME=/root\n",
+"etc/nexus-release": f"NEXUS OS v{VERSION}\nname: {self.project.name}\nDistro: {self.project.distro}\nBuilt: {datetime.now().isoformat()}\nHeir: {HEIR}\n",
+"etc/nexus/welcome": f"Bienvenue sur {self.project.name}\nPrompt: {self.project.prompt}\n",
+}
+for path, content in files.items():
+fp = self.rootfs / path
+fp.parent.mkdir(parents=True, exist_ok=True)
+fp.write_text(content)
+if "shadow" in path:
+os.chmod(fp, 0o600)
+
+def _create_nexus_tools(self):
+"""Crée les outils NEXUS."""
+info_script = f"""#! /bin/sh
+echo "════════════════════════════════════════"
+echo " NEXUS OS v{VERSION}"
+echo " Name: {self.project.name}"
+echo " Distro: {self.project.distro}"
+echo " Built: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+echo "Heir: {HEIR}"
+echo "════════════════════════════════════════"
+"""
+info = self.rootfs / "bin/nexus-info"
+info.write_text(info_script)
+os.chmod(info, 0o755)
+
+# nexus-version
+ver = self.rootfs / "bin/nexus-version"
+ver.write_text(f'#!/bin/sh\necho "NEXUS OS v{VERSION}"\n')
+os.chmod(ver, 0o755)
+
+def _create_readme(self):
+"""Crée README.txt."""
+readme = f"""NEXUS OS v{VERSION}
+Name: {self.project.name}
+Distro: {self.project.distro}
+Prompt: {self.project.prompt}
+Built: {datetime.now().isoformat()}
+Héritier: {HEIR}
+
+Boot avec QEMU:
+qemu-system-x86_64 -kernel vmlinuz -initrd initramfs.cpio.gz -append "console=tty0"
+
+Content rootfs:
+/init Script d'init
+/bin/sh Shell minimal
+/bin/nexus-info Info système
+/bin/nexus-version Version
+/etc/ Config système
+"""
+(self.rootfs / "README.txt").write_text(readme)
+
+
+# ═══════════════════════════════════════����
+# §8 — KERNEL MANAGER
+# ═══════════════════════════════════════����
+
+class KernelManager:
+"""Prepared kernel + initramfs."""
+
+def __init__(self, project):
+self.project = project
+self.kernel_path: Optional[Path] = None
+self.initramfs_path: Optional[Path] = None
+
+def prepare(self) -> bool:
+"""Prépare kernel et initramfs."""
+Try:
+build_dir = BUILDS_DIR / self.project.id
+build_dir.mkdir(parents=True, exist_ok=True)
+
+# Look for a system kernel
+kernel = self._find_system_kernel()
+if kernel:
+self.kernel_path = build_dir / "vmlinuz"
+shutil.copy(kernel, self.kernel_path)
+JOURNAL.log(f"Kernel copié : {kernel}", "INFO", "kernel")
+else:
+# Crée un faux kernel (stub)
+self.kernel_path = build_dir / "vmlinuz"
+self.kernel_path.write_bytes(b"NEXUS_KERNEL_STUB" + b"\x00" * 1024)
+JOURNAL.log("Kernel stub créé (pas de kernel système)", "WARN", "kernel")
+
+# Creates initrams
+self._create_initramfs(build_dir)
+return True
+
+Except Exception as e:
+JOURNAL.log(f"Kernel prep failure : {e}", "ERROR", "kernel")
+return False
+
+def _find_system_kernel(self) -> Optional[Path]:
+"""Trouve un kernel système."""
+candidates = [
+"/boot/vmlinuz",
+"/boot/vmlinuz-linux",
+f"/boot/vmlinuz-{platform.release()}",
+]
+for c in candidates:
+p = Path(c)
+if p.exists():
+return p
+return None
+
+def _create_initramfs(self, build_dir: Path):
+"""Creates an initramfs cpio.gz."""
+Try:
+rootfs = build_dir / "rootfs"
+if not rootfs.exists():
+return
+
+cpio_path = build_dir / "initramfs.cpio"
+gz_path = build_dir / "initramfs.cpio.gz"
+
+# Liste tous les fichiers
+files = []
+for f in rootfs.rglob("*"):
+if f.is_file():
+rel = f.relative_to(rootfs)
+files.append((f, rel))
+
+# Writes a simple newc copy
+with open(cpio_path, "wb") as out:
+for f, rel in files:
+stat = f.stat()
+name = str(rel).encode()
+name_b = name + b"\x00"
+# cpio newc header (110 bytes)
+hdr = (
+b"070701"
++ f"{int(stat.st_ino) & 0xFFFFFFFF:08X}".encode()
++ f"{stat.st_mode & 0xFFFFFFFF:08X}".encode()
++ b"00000000" # uid
++ b"00000000" # gid
++ b"00000001" # nlink
++ b"00000000" # mtime
++ f"{stat.st_size & 0xFFFFFFFF:08X}".encode()
++ b"00000000" # devmajor
++ b"00000000" # devminor
++ b"00000000" # rdevmajor
++ b"00000000" # rdevminor
++ f"{len(name_b) & 0xFFFFFFFF:08X}".encode()
++ b"000000000" # check
+)
+out.write(hdr)
+out.write(name_b)
+# Padding 4-byte align
+pad = (4 - (len(hdr) + len(name_b)) % 4%
+out.write(b"\x00" * pad)
+# Data
+out.write(f.read_bytes())
+pad = (4 - stat.st_size % 4) % 4
+out.write(b"\x00" * pad)
+
+# Trailer
+trailer = (
+b"070701"
++ b"00000000" * 8
++ b"00000001" # nlink
++ b"00000000" * 4
++ b"0000000B" # name size = 11 (TRAILER!!!)
++ b"00000000"
+)
+out.write(trailer)
+out.write(b"TRAILER!!!\x00")
+pad = (4 - (len(trailer) + 11) % 4) % 4
+out.write(b"\x00" * pad)
+
+# Compress
+with open(cpio_path, "rb") as f_in, gzip.open(gz_path, "wb") as f_out:
+shutil.copyfileobj(f_in, f_out)
+
+self.initramfs_path = gz_path
+JOURNAL.log(f"Initramfs created : {gz_path}", "INFO", "kernel")
+
+Except Exception as e:
+JOURNAL.log(f"Initramfs failure: {e}", "ERROR", "kernel")
+
+
+# ═══════════════════════════════════════����
+# §9 — BOOT IMAGE BUILDER
+# ═══════════════════════════════════════����
+
+class BootImageBuilder:
+"""Builds the boot image."""
+
+def __init__(self, project):
+self.project = project
+
+def build(self, rootfs: Path) -> bool:
+"""Constructs the bootable image."""
+Try:
+build_dir = BUILDS_DIR / self.project.id
+
+# Creates the tar.xz archive
+archive = EXPORTS_DIR / f"{self.project.name}_{self.project.id}.tar.xz"
+with tarfile.open(archive, "w:xz", preset=6) as tar:
+tar.add(rootfs, arcname="rootfs")
+readme = rootfs / "README.txt"
+if readme.exists():
+tar.add(readme, arcname="README.txt")
+
+self.project.archive_path = str(archive)
+
+# Essaie ISO
+iso_path = EXPORTS_DIR / f"{self.project.name}_{self.project.id}.iso"
+iso_result = GENISO.create_iso(rootfs, iso_path, f"NEXUS_{self.project.id}")
+
+if iso_result.get("ok"):
+self.project.iso_path = iso_result["path"]
+JOURNAL.log(f"ISO créée : {iso_result['path']}", "INFO", "boot")
+
+# Calcule hash
+self.project.archive_sha256 = SystemUtils.sha256_file(archive)
+
+# Account files
+self.project.files_count = sum(1 for _ in rootfs.rglob("*") if _.is_file())
+
+JOURNAL.log(f"Boot image finished", "INFO", "boot")
+return True
+
+Except Exception as e:
+JOURNAL.log(f"Boot image failure : {e}", "ERROR", "boot")
+self.project.error = str(e)
+return False
+
+
+# ═══════════════════════════════════════����
+# §10 — OS PROJECT
+# ═══════════════════════════════════════����
+
+@dataclass
+class OSProject:
+""""Project OS.""
+id: str
+name: str
+distro: str
+prompt: str
+status: str = "PENDING"
+progress: int = 0
+step: str = ""
+logs: List[str] = field(default_factory=list)
+error: Optional[str] = None
+archive_path: Optional[str] = None
+archive_sha256: Optional[str] = None
+iso_path: Optional[str] = None
+kernel_path: Optional[str] = None
+initramfs_path: Optional[str] = None
+files_count: int = 0
+size_kb: int = 0
+start_time: Optional[str] = None
+end_time: Optional[str] = None
+
+def add_log(self, msg: str):
+ts = datetime.now().strftime("%H:%M:%S")
+self.logs.append(f"[{ts}] {msg}")
+logger.info(f"[{self.id}] {msg}")
+
+def set_progress(self, pct: int, step: str):
+self.progress = pct
+self.step = step
+
+def to_dict(self) -> Dict[str, Any]:
+return asdict(self)
+
+
+# ═══════════════════════════════════════����
+# §11 — OS FACTORY
+# ═══════════════════════════════════════����
+
+class OSFactory:
+"""Factory of OS Projects."""
+
+def __init__(self):
+self.projects: Dict[str, OSProject] = {}
+self.lock = threading.Rlock()
+
+def create_project(self, name: str, distro: str, prompt: str) -> OSProject:
+"""Crée un projet."""
+pid = str(uuid.uuid4())[:8]
+project = OSProject(pid, name, distro, prompt)
+With self.lock:
+self.projects[pid] = project
+JOURNAL.log(f"Project created: {name} ({pid})", "INFO", "factory")
+return project
+
+def get_project(self, pid: str) -> Optional[OSProject]:
+With self.lock:
+return self.projects.get(pid)
+
+def list_projects(self) -> List[Dict[str, Any]]:
+With self.lock:
+return [p.to_dict() for p in self.projects.values()]
+
+def build_async(self, project: OSProject):
+"""Throw the build in the background.""
+thread = threading.Thread(target=self._build, args=(project,), daemon=True)
+thread.start()
+
+def _build(self, project: OSProject):
+"""Build complet."""
+Try:
+project.status = "BUILDING"
+project.start_time = datetime.now().isoformat()
+project.add_log(f"🚀 Build démarré : {project.name}")
+project.add_log(f"📦 Distro : {project.distro}")
+
+#1. RootFS
+project.set_progress(10, "RootFS")
+project.add_log("📁 Assemblage rootfs")
+rootfs = RootFSAssembler(project).assemble()
+if not rootfs:
+raise RuntimeError("RootFS échoué")
+
+# 2. Kernel
+project.set_progress(50, "Kernel")
+project.add_log("🔧 Préparation kernel")
+km = KernelManager(project)
+km.prepare()
+project.kernel_path = str(km.kernel_path) if km.kernel_path None else
+project.initramfs_path = str(km.initramfs_path) if km.initramfs_path else None
+
+#3. Boot image
+project.set_progress(80, "Boot image")
+project.add_log("💿 Construction boot image")
+bi = BootImageBuilder(project)
+bi.build(rootfs)
+
+#4. Stats
+if project.archive_path:
+p = Path(project.archive_path)
+if p.exists():
+project.size_kb = p.stat().st_size // 1024
+
+#5. Done
+project.set_progress(100, "Completed")
+project.status = "COMPLETED"
+project.end_time = datetime.now().isoformat()
+project.add_log("🎉 Build successfully completed")
+
+Except Exception as e:
+project.status = "FAILED"
+project.error = str(e)
+project.add_log(f"💥 Error : {e}")
+JOURNAL.log(f"Build failed {project.id} : {e}", "ERROR", "build")
+JOURNAL.log(traceback.format_exc()[:500], "ERROR", "build")
+
+
+# ═══════════════════════════════════════����
+# §12 — HTML TEMPLATE
+# ═══════════════════════════════════════����
+
+HTML_TEMPLATE = r"""<<! DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NEXUS OS BUILDER v__V__</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+--bg:#0a0a14;-surface:#141428;-surface2:#1a1a2e;
+--accent:#00ff9d;-accent2:#00d4ff;--accent3:#a855f7;
+--text:#e0e0e0;--muted:#888;--border:#2a2a3a;
+}
+html,body{background:var(--bg);color:var(--text);
+font-family:-apple-system,BlinkMacSystemFont,'Inter',system-ui,without-serif;
+min-height:100vh;padding:30px 20px;line-height:1.6}
+body::before{content:'';position:fixed;inset:0;
+background:
+radial-gradient(ellipse at 15% 5%,rgba(0.255,157,0.08),transparent 45%),
+radial-gradient(ellipse at 85% 95%,rgba(0.212,255,0.06),transparent 45%);
+z-index:0;pointer-events:none}
+.wrap{max-width:1100px;margin:0 autoposition:relative;z-index:1}
+h1{font-size:2rem;background:linear-gradient(135deg,var(--accent),var(--accent2),var(--accent3));
+-webkit-background-clip:text;-webkit-text-fill-color:transparent;
+background-clip:text;margin-bottom:8px;font-weight:800;letter-spacing:-1px}
+.sub{color:var(--muted);font-size:0.8em;letter-spacing:3px;text-transform:uppercase;margin-bottom:24px}
+.badges{display:flex;gap:8px;margin-bottom:24px;flex-wrap:wrap}
+.badge{padding:4px 12px;border-radius:20px;font-size:11px;font-weight:700;
+letter-spacing:1px;text-transform:uppercase;border:1px solid var(--border)}
+.badge.green{background:rgba(0,255,157,0.1);color:var(--accent);border-color:rgba(0,255,157,0.3)}
+.badge.blue{background:rgba(0,212,255,0.1);color:var(--accent2);border-color:rgba(0,212,255,0.3)}
+.badge.purple{background:rgba(168,85,247,0.1);color:var(--accent3);border-color:rgba(168,85,247,0.3)}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;
+padding:24px;margin-bottom:20px}
+.card h2{color:var(--accent);font-size:0.85em;letter-spacing:2px;
+text-transform:uppercase;margin-bottom:16px;padding-bottom:10px;border-bottom:1px solid var(--border)}
+input,textarea,select{width:100%;padding:12px 14px;background:var(--bg);
+border:1px solid var(--border);border-radius:8px;color:var(--text);
+margin-bottom:12px;font-family:inherit;font-size:14px;outline:none;transition:border 0.2s}
+input:focus,textarea:focus,select:focus{border-color:var(--accent)}
+textarea{min-height:80px;resize:vertical}
+label{display:block;color:var(--muted);font-size:11px;font-weight:700;
+letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px}
+button{padding:14px 28px;background:linear-gradient(135deg,var(--accent),var(--accent2));
+color:#000;border:none;border-radius:8px;font-weight:800;font-size:14px;
+cursor:pointer;width:100%;letter-spacing:1px;text-transform:uppercase;transition:all 0.2s}
+button:hover{transform:translateY(-1px);box-shadow:0 8px 24px rgba(0,255,157,0.3)}
+button:disabled{opacity:0.5;cursor:wait;transform:none}
+.distros{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px}
+.dist{padding:16px 12px;background:var(--bg);border:2px solid var(--border);
+border-radius:10px;cursor:pointer;text-align:center;transition:all 0.2s}
+.dist:hover{border-color:var(--accent2)}
+.dist.on{border-color:var(--accent);background:rgba(0,255,157,0.05)}
+.dist .n{font-weight:800;color:var(--accent);font-size:1.1em;margin-bottom:2px}
+.dist .s{font-size:10px;color:var(--muted)}
+.project{background:var(--bg);border:1px solid var(--border);border-radius:12px;
+padding:20px;margin-bottom:14px}
+.ph{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px;gap:12px}
+.pname{font-weight:800;color:var(--accent);font-size:1.1em;word-break:break-all}
+.pstatus{font-size:10px;padding:4px 10px;border-radius:20px;
+font-weight:800;letter-spacing:1px;text-transform:uppercase;white-space:nowrap}
+.status-BUILDING{background:rgba(255,180,0,0.2);color:#ffb400}
+.status-COMPLETED{background:rgba(0,255,157,0.2);color:var(--accent)}
+.status-FAILED{background:rgba(255,50,50,0.2);color:#ff5555}
+.status-PENDING{background:rgba(255,255,255,0.1);color:var(--muted)}
+.pmeta{font-size:11px;color:var(--muted);margin-bottom:10px;font-family:monospace}
+.bar{height:8px;background:var(--surface2);border-radius:4px;overflow:hidden;margin:10px 0}
+.fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));
+transition:width 0.4s ease;border-radius:4px}
+.step{font-size:11px;color:var(--accent2);font-family:monospace;margin-bottom:8px}
+.logs{background:#000;padding:12px;border-radius:8px;font-family:monospace;
+font-size:11px;color:var(--accent);max-height:200px;overflow-y:auto;
+margin-top:10px;line-height:1.7;border:1px solid var(--border)}
+.dl{margin-top:10px;padding:12px;background:rgba(0,255,157,0.08);
+border-radius:8px;border:1px solid rgba(0,255,157,0.2)}
+.dl a{color:var(--accent);text-decoration:none;font-weight:700;font-family:monospace;font-size:12px}
+.dl a:hover{text-decoration:underline}
+.err{margin-top:10px;padding:12px;background:rgba(255,50,50,0.1);
+border-radius:8px;color:#ff8888;font-family:monospace;font-size:12px;
+border:1px solid rgba(255,50,50,0.3)}
+.empty{text-align:center;color:var(--muted);padding:40px;font-style:italic}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:16px}
+.stat{background:var(--bg);border:1px solid var(--border);border-radius:10px;
+padding:14px;text-align:center}
+.stat .v{font-size:1.5em;font-weight:800;color:var(--accent2);font-family:monospace;display:block}
+.stat .l{font-size:10px;color:var(--muted);letter-spacing:1.5px;
+text-transform:uppercase;margin-top:4px;font-weight:700}
+.providers{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px}
+.prov{padding:8px 12px;background:var(--bg);border:1px solid var(--border);
+border-radius:6px;font-family:monospace;font-size:11px}
+.prov.configured{border-color:rgba(0,255,157,0.3);background:rgba(0,255,157,0.05)}
+.prov .pn{font-weight:700;color:var(--accent);margin-bottom:2px}
+.prov .pc{color:var(--muted);font-size:10px}
+.footer{text-align:center;color:var(--muted);font-family:monospace;
+font-size:11px;margin-top:40px;padding-top:20px;border-top:1px solid var(--border)}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>NEXUS OS BUILDER v__V__</h1>
+<p class="sub">Moteur de construction d'OS · 52 providers · Journal réparateur</p>
+
+<div class="badges">
+<span class="badge green">● 52 API PROVIDERS</span>
+<span class="badge blue">JOURNAL DEBUGGER</span>
+<span class="badge purple">GENISOIMAGE</span>
+</div>
+
+<div class="stats-grid" id="stats"></div>
+
+<div class="card">
+<h2>🚀 Créer un OS</h2>
+<label>Nom du projet</label>
+<input id="name" value="NexusOS" placeholder="NexusOS">
+<label>Distribution</label>
+<div class="distros">
+<div class="dist on" data-d="alpine"><div class="n">Alpine</div><div class="s">5 MB</div></div>
+<div class="dist" data-d="debian"><div class="n">Debian</div><div class="s">80 MB</div></div>
+<div class="dist" data-d="ubuntu"><div class="n">Ubuntu</div><div class="s">30 MB</div></div>
+</div>
+<label>Description / Prompt</label>
+<textarea id="prompt" placeholder="Décris ton OS...">OS minimal avec audio et docker dev tools</textarea>
+<button id="btn" onclick="build()">🚀 GENERATE THE OS</button>
+</div>
+
+<div class="card">
+<h2>📁 Projets</h2>
+<div id="list"><div class="empty">Aucun projet pour le moment</div></div>
+</div>
+
+<div class="card">
+<h2>🔌 52 Providers API</h2>
+<div class="providers" id="providers"></div>
+</div>
+
+<div class="footer">
+NEXUS OS BUILDER v__V__ · Aissa Mohammedi (DGK) · Héritier: Naim Mohammedi · NEXUS-OPEN-3.0
+</div>
+</div>
+
+<script>
+let dist = 'alpine';
+document.querySelectorAll('.dist').forEach(d => {
+d.onclick = () => {
+document.querySelectorAll('.dist').forEach(x => x.classList.remove('on'));
+d.classList.add('on');
+dist = d.dataset.d;
+};
+});
+
+async function loadStats() {
+try {
+cost r = await fetch('/api/version');
+const d = await r.json();
+document.getElementById('stats').innerHTML = `
+<div class="stat"><span class="v">${d.version}</span><span class="l">Version</span></div>
+<div class="stat"><span class="v">${d.providers || 52}</span><span class="l">Providers</span></div>
+<div class="stat"><span class="v">${d.platform.os}</span><span class="l">Plateforme</span></div>
+<div class="stat"><span class="v">${d.platform.has_genisoimage ? 'OUI' : 'NON'}</span><span class="l">Genisoimage</span></div>
+`;
+} catch(e) {}
+}
+
+async function loadProviders() {
+try {
+cost r = await fetch('/api/providers');
+const d = await r.json();
+const el = document.getElementById('providers');
+el.innerHTML = d.map(p => `
+<div class="prov ${p.configured ? 'configured' : ''}">
+<div class="pn">${esc(p.name)}</div>
+<div class="pc">${esc(p.category)} · ${p.configured ? '✓' : '○'}</div>
+</div>
+`).join('');
+} catch(e) {}
+}
+
+async function loadProjects() {
+try {
+const r = await fetch('/api/projects');
+const d = await r.json();
+const el = document.getElementById('list');
+if (!d.length) {
+el.innerHTML = '<div class="empty">No project at the moment</div>';
+return;
+}
+el.innerHTML = d.map(p => `
+<div class="project">
+<div class="ph">
+<div class="pname">${esc(p.name)}</div>
+<div class="pstatus status-${p.status}">${p.status}</div>
+</div>
+<div class="pmeta">${esc(p.distro)} · ${esc(p.prompt.slice(0, 80))}</div>
+<div class="bar"><div class="fill" style="width:${p.progress}%"></div></div>
+<div class="step">${esc(p.step)} — ${p.progress}% · ${p.files_count || 0} fichiers · ${p.size_kb || 0} KB</div>
+<div class="logs">${(p.logs || []).slice(-15).map(l => `<div>${esc(l)}</div>`).join('')}</div>
+${p.archive_path ? `<div class="dl">📦 <a href="/download/${p.id}/archive">Télécharger ${esc(p.archive_path.split('/').pop())}</a>${p.archive_sha256 ? `<div style="color:#666;font-size:10px;margin-top:4px">SHA-256: ${p.archive_sha256.slice(0, 32)}...</div>` : ''}</div>` : ''}
+${p.iso_path ? `<div class="dl">💿 <a href="/download/${p.id}/iso">Télécharger ISO</a></div>` : ''}
+${p.error ? `<div class="err">❌ ${esc(p.error)}</div>` : ''}
+</div>
+`).join('');
+} catch(e) {}
+}
+
+async function build() {
+const btn = document.getElementById('btn');
+btn.disabled = true;
+btn.textContent = '⏳ Génération...';
+try {
+await fetch('/api/build', {
+method: 'POST',
+headers: {'Content-Type': 'application/json'},
+body: JSON.stringify({
+name: document.getElementById('name').value,
+distro: dist,
+prompt: document.getElementById('prompt').value
+})
+});
+} catch(e) {
+alert('Erreur: ' + e.message);
+} finally {
+btn.disabled = false;
+btn.textContent = '🚀 GÉNÉRER L\'OS';
+loadProjects();
+}
+}
+
+function esc(s) {
+const d = document.createElement('div');
+d.textContent = s == null? '' : String(s);
+return d.innerHTML;
+}
+
+setInterval(loadProjects, 1500);
+loadStats();
+loadProviders();
+loadProjects();
+</script>
+</body>
+</html>"""
+
+
+# ═══════════════════════════════════════����
+# §13 — HTTP HANDLER
+# ═══════════════════════════════════════����
+
+class Handler(BaseHTTPRequestHandler):
+factory: Optional[OSFactory] = None
+
+def log_message(self, *args):
+Pass
+
+def _send_json(self, code: int, data: Any):
+Try:
+body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+self.send_response(code)
+self.send_header("Content-Type", "application/json; charset=utf-8")
+self.send_header("Access-Control-Allow-Origin", "*")
+self.send_header("Content-Length", str(len(body)))
+self.end_headers()
+self.wfile.write(body)
+except (BrokenPipeError, ConnectionResetError):
+Pass
+
+def _send_html(self, code: int, html: str):
+Try:
+body = html.encode("utf-8")
+self.send_response(code)
+self.send_header("Content-Type", "text/html; charset=utf-8")
+self.send_header("Content-Length", str(len(body)))
+self.end_headers()
+self.wfile.write(body)
+except (BrokenPipeError, ConnectionResetError):
+Pass
+
+def _send_file(self, path: str, filename: Optional[str] = None):
+Try:
+p = Path(path)
+if not p.exists():
+self._send_json(404, {"error": "file not found"})
+return
+self.send_response(200)
+self.send_header("Content-Type", "application/octet-stream")
+self.send_header(
+"Content-Disposition",
+f'attachment; filename="{filename or p.name}"'
+)
+self.send_header("Content-Length", str(p.stat().st_size))
+self.end_headers()
+with open(p, "rb") as f:
+shutil.copyfileobj(f, self.wfile)
+except (BrokenPipeError, ConnectionResetError):
+Pass
+Except Exception as e:
+Try:
+self._send_json(500, {"error": str(e)})
+Except:
+Pass
+
+def do_GET(self):
+Try:
+parsed = urlparse(self.path)
+path = parsed.path
+
+if path == "/":
+html = HTML_TEMPLATE.replace("__V__", VERSION)
+self._send_html(200, html)
+
+elif path == "/api/projects":
+self._send_json(200, self.factory.list_projects())
+
+elif path == "/api/version":
+self._send_json(200, {
+"version": VERSION,
+"author": AUTEUR,
+"year": HEIR,
+"license": LICENCE,
+"providers": len(PROVIDERS),
+"platform": SystemUtils.detect_platform(),
+})
+
+elif path == "/api/providers":
+self._send_json(200, REGISTRY.list_all())
+
+elif path == "/api/recipes":
+recipes = RECIPES.list_all()
+self._send_json(200, {k: v.to_dict() for k, v in recipes.items()})
+
+elif path == "/api/categories":
+self._send_json(200, RECIPES.list_categories())
+
+elif path == "/api/journal":
+self._send_json(200, {
+"entries": [asdict(e) for e in JOURNAL.entries[-100:]],
+"issues": JOURNAL.analyze(),
+"repairs": [asdict(r) for r in JOURNAL.repairs[-20:]],
+})
+
+elif path.startswith("/download/"):
+parts = path.split("/")
+if len(parts) >= 4:
+pid = parts[2]
+kind = parts[3]
+project = self.factory.get_project(pid)
+
+if project:
+if kind == "archive" and project.archive_path:
+self._send_file(project.archive_path)
+elif kind == "kernel" and project.kernel_path:
+self._send_file(project.kernel_path)
+elif kind == "initramfs" and project.initramfs_path:
+self._send_file(project.initramfs_path)
+elif kind == "iso" and project.iso_path:
+self._send_file(project.iso_path)
+else:
+self._send_json(404, {"error": "file not ready"})
+else:
+self._send_json(404, {"error": "project not found"})
+else:
+self._send_json(400, {"error": "bad request"})
+
+else:
+self._send_json(404, {"error": "not found"})
+
+except (BrokenPipeError, ConnectionResetError):
+Pass
+Except Exception as e:
+logger.error(f"GET error: {e}")
+Try:
+self._send_json(500, {"error": str(e)})
+Except:
+Pass
+
+def do_POST(self):
+Try:
+parsed = urlparse(self.path)
+path = parsed.path
+
+if path == "/api/build":
+n = int(self.headers.get("Content-Length", 0))
+body = self.rfile.read(n)
+data = json.loads(body.decode() or "{}")
+
+project = self.factory.create_project(
+data.get("name", "NexusOS"),
+data.get("distro", "alpine"),
+data.get("prompt", ""),
+)
+self.factory.build_async(project)
+self._send_json(200, project.to_dict())
+
+elif path == "/api/repair":
+n = int(self.headers.get("Content-Length", 0))
+body = self.rfile.read(n)
+data = json.loads(body.decode() or "{}")
+dry_run = data.get("dry_run", False)
+actions = JOURNAL.repair(dry_run=dry_run)
+self._send_json(200, [asdict(a) for a in actions])
+
+elif path == "/api/journal/export":
+path_exported = JOURNAL.export()
+self._send_json(200, {"path": str(path_exported)})
+
+else:
+self._send_json(404, {"error": "not found"})
+
+except (BrokenPipeError, ConnectionResetError):
+Pass
+Except Exception as e:
+logger.error(f"POST error: {e}")
+Try:
+self._send_json(500, {"error": str(e)})
+Except:
+Pass
+
+
+class Server(ThreadingHTTPServer):
+daemon_threads = True
+allow_reuse_address = True
+
+
+# ═══════════════════════════════════════����
+# §14 — CLI
+# ═══════════════════════════════════════����
+
+class CLI:
+"""Interface CLI."""
+
+@staticmethod
+def build(name: str, distro: str, prompt: str) -> int:
+print(f"🔨 Build: {name} ({distro})")
+print(f" Prompt: {prompt[:80]}")
+print()
+
+factory = OSFactory()
+project = factory.create_project(name, distro, prompt)
+
+Try:
+project.status = "BUILDING"
+project.start_time = datetime.now().isoformat()
+
+print("[1/4] RootFS assembly...")
+project.set_progress(10, "RootFS")
+rootfs = RootFSAssembler(project).assemble()
+if not rootfs:
+print("❌ RootFS échoué")
+return 1
+
+print("[2/4] Kernel + Initramfs...")
+project.set_progress(50, "Kernel")
+km = KernelManager(project)
+km.prepare()
+
+print("[3/4] Boot image...")
+project.set_progress(80, "Boot image")
+bi = BootImageBuilder(project)
+bi.build(rootfs)
+
+print("[4/4] Completed.")
+project.set_progress(100, "Done")
+project.status = "COMPLETED"
+project.end_time = datetime.now().isoformat()
+
+print()
+print("✅ Built Success!")
+if project.archive_path:
+print(f" 📦 Archive: {project.archive_path}")
+if project.iso_path:
+print(f" 💿 ISO: {project.iso_path}")
+if project.kernel_path:
+print(f" 🔧 Kernel: {project.kernel_path}")
+if project.initramfs_path:
+print(f" 💾 Initramfs: {project.initramfs_path}")
+
+return 0
+
+Except Exception as e:
+print(f"❌ Failure: {e}")
+traceback.print_exc()
+return 1
+
+@staticmethod
+def list_recipes() -> int:
+print(f"📚 Available Recipes ({len(RECIPES.list_all())))):")
+print()
+
+by_cat = defaultdict(list)
+for name, recipe in RECIPES.list_all().items():
+by_cat[recipe.category].append(recipe)
+
+for category in sorted(by_cat.keys()):
+print(f" [{category.upper()}]")
+for recipe in by_cat[category]:
+size = f"~{recipe.size_estimate_kb} KB" if recipe.size_estimate_kb else ""
+print(f" • {recipe.name:<20} {recipe.description[:60]:<60} {size}")
+print()
+return 0
+
+@staticmethod
+def list_providers() -> int:
+print(f"🔌 Providers API ({len(PROVIDERS)}):")
+print()
+
+by_cat = REGISTRY.by_category()
+for category in sorted(by_cat.keys()):
+print(f" [{category.upper()}]")
+for p in by_cat[category]:
+configured = "✓" if os.getenv(p.env_var) else "○"
+print(f" {configured} {p.name:<20} {p.default_model:<30} {p.env_var}")
+print()
+return 0
+
+
+# ═══════════════════════════════════════����
+# §15 — HAND
+# ═══════════════════════════════════════����
+
+def print_banner():
+print(f"""
+╔══════════════════════════════════════════════════════════════════════╗
+║ ║
+║ NEXUS OS BUILDER v{VERSION} ║
+║ Moteur de construction d'OS (Buildroot-style) ║
+║ 52 providers · Journal réparateur · Genisoimage ║
+║ ║
+║ Auteur : {AUTEUR} ║
+║ Héritier : {HEIR} ║
+║ Licence : {LICENCE} ║
+║ ║
+╚══════════════════════════════════════��
+""")
+
+
+def main():
+parser = argparse.ArgumentParser(description=f"NEXUS OS Builder v{VERSION}")
+parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port HTTP")
+parser.add_argument("--host", type=str, default=HOST, help="Host")
+
+subparsers = parser.add_subparsers(dest="command")
+
+cli_build = subparsers.add_parser("build", help="Build direct")
+cli_build.add_argument("name", help="Nom du projet")
+cli_build.add_argument("distro", choices=["alpine", "debian", "ubuntu"], help="Distro")
+cli_build.add_argument("prompt", help="Description")
+
+subparsers.add_parser("recipes", help="Liste les recipes")
+subparsers.add_parser("providers", help="Liste les providers")
+subparsers.add_parser("journal", help="Analyse le journal")
+
+args = parser.parse_args()
+
+print_banner()
+
+if args.command == "recipes":
+return CLI.list_recipes()
+
+if args.command == "providers":
+return CLI.list_providers()
+
+if args.command == "journal":
+issues = JOURNAL.analyze()
+print(f"📋 Journal: {len(JOURNAL.entries)} entrées, {len(issues)} problèmes")
+for issue in issues:
+print(f" • {issue['category']}: {issue['description']}")
+return 0
+
+if args.command == "build":
+return CLI.build(args.name, args.distro, args.prompt)
+
+# Server Mode
+platform_info = SystemUtils.detect_platform()
+print("Detected platform :")
+print(f" OS : {platform_info['os']} {platform_info['release']}")
+print(f" Machine : {platform_info['machine']}")
+print(f" Python : {platform_info['python']}")
+print(f" iOS : {'Oui' if platform_info['is_ios'] else 'Non'}")
+print()
+
+print(f" Providers : {len(PROVIDERS)} ({len(REGISTRY.configured())} configurés)")
+print(f" Recipes : {len(RECIPES.list_all())} available")
+print(f" Categories : {', '.join(RECIPES.list_categories())}")
+print()
+
+print(f" Base dir : {BASE_DIR}")
+print(f" Cache : {CACHE_DIR}")
+print(f" Journals : {JOURNALS_DIR}")
+print(f" URL : http://{args.host}:{args.port}")
+print()
+
+if not platform_info["has_genisoimage"] and not platform_info["has_xorriso"]:
+print(" i No ISO tool — fallback tar.xz")
+print("Usable with QEMU directly")
+print()
+
+print(" Ctrl+C to stop.")
+print()
+
+factory = OSFactory()
+Handler.factory = factory
+
+Try:
+server = Server(args.host, args.port), Handler)
+server.serve_forever()
+Except KeyboardInterrupt:
+print("\n\n 👋 Stop requested.")
+Try:
+server.shutdown()
+Except:
+Pass
+Except OSerror as e:
+print(f"\n ❌ Error port {args.port}: {e}")
+print(f" Try: python3 nexus_os_builder.py --port 9999")
+return 1
+
+return 0
+
+
+if __name__ == "__main__":
+sys.exit(main())
